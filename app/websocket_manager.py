@@ -27,19 +27,26 @@ class ConnectionManager:
         if job_id in self.active_connections:
             del self.active_connections[job_id]
 
-    async def send_result_to_client(self, job_id: str, result_url: str) -> bool:
-        """특정 Job ID 클라이언트에게 결과 URL 푸시"""
+    async def send_result_to_client(self, job_id: str, result_urls) -> bool:
+        """특정 Job ID 클라이언트에게 결과 URL(또는 URL 리스트) 푸시
+
+        `result_urls`는 단일 문자열이거나 문자열 리스트일 수 있습니다.
+        기존 단일 URL 사용 방식과 호환되도록 구현되어 있습니다.
+        """
         entry = self.active_connections.get(job_id)
         if entry:
             websocket = entry.get("websocket")
             try:
-                print(f"[DEBUG] Sending result to client job_id={job_id} url={result_url}")
+                # normalize to list for consistent payload
+                urls = result_urls if isinstance(result_urls, list) else [result_urls]
+                print(f"[DEBUG] Sending result to client job_id={job_id} urls={urls}")
                 await websocket.send_json({
                     "status": "COMPLETED",
-                    "result_url": result_url
+                    "result_urls": urls,
+                    # for backward compatibility also include single result_url (first)
+                    "result_url": urls[0] if urls else None
                 })
                 print(f"[DEBUG] send_json succeeded for job_id={job_id}")
-                # 푸시 후, 클라이언트가 연결을 닫도록 유도합니다.
                 return True
             except Exception as e:
                 print(f"[WS Push Error] Job ID {job_id}: {e}")

@@ -4,6 +4,7 @@
 fastapi
 uvicorn[standard]
 pydantic
+python-multipart
 
 # 환경 및 AWS 통신
 python-dotenv
@@ -14,3 +15,4 @@ python-jose
 
 # MariaDB/MySQL 데이터베이스 연결
 mysql-connector-python
+requests

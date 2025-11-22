@@ -3,8 +3,11 @@
 import os
 from dotenv import load_dotenv
 
-# .env 파일 로드
-load_dotenv()
+# Prefer .env.local if present (local overrides), otherwise fall back to default .env
+if os.path.exists('.env.local'):
+    load_dotenv('.env.local')
+else:
+    load_dotenv()
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware # CORS 임포트
@@ -24,8 +27,8 @@ app = FastAPI(
 # 1. CORS 미들웨어 설정 (localhost:29000 허용)
 # -----------------------------------------------------------------
 origins = [
-    "http://localhost:29000",
-    "http://127.0.0.1:29000",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
     "http://localhost:5000",
 ]
 

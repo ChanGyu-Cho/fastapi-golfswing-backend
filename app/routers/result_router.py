@@ -178,37 +178,122 @@ async def handle_webhook(request: Request):
     if not job_id or not s3_key:
         raise HTTPException(status_code=400, detail="job_id and s3_result_path required")
 
-    # 2) DB 업데이트: COMPLETED (RunPod 완료)
+    # 2) DB 업데이트: COMPLETED (RunPod 완료) 및 s3_result_paths 저장 시도
     try:
-        db_client.update_upload_status(job_id=job_id, status="COMPLETED", s3_result_path=s3_key)
+        import json as _json
+        s3_paths_json = None
+        if data.get("s3_result_paths"):
+            try:
+                s3_paths_json = _json.dumps(data.get("s3_result_paths"))
+            except Exception:
+                s3_paths_json = str(data.get("s3_result_paths"))
+
+        # Use new helper that attempts to write s3_result_paths when available
+        try:
+            db_client.update_upload_status_with_paths(job_id=job_id, status="COMPLETED", s3_result_path=s3_key, s3_result_paths=s3_paths_json)
+        except Exception:
+            # fallback to old API
+            db_client.update_upload_status(job_id=job_id, status="COMPLETED", s3_result_path=s3_key)
     except Exception as e:
         print(f"[DB Update Error] job_id={job_id} error={e}")
 
-    # 3) presigned GET 생성
-    try:
-        presigned_url = s3_client.create_presigned_get_url(s3_key)
-    except Exception as e:
-        print(f"[S3 Presign Error] key={s3_key} error={e}")
-        raise HTTPException(status_code=500, detail="Failed to generate presigned result URL")
+    # 3) presigned GET 생성: primary 하나뿐 아니라 전달된 모든 경로에 대해 presigned URL을 생성
+    presigned_urls = []
+    all_keys = data.get("s3_result_paths") or []
+    # Ensure primary key is present at front
+    if s3_key and s3_key not in all_keys:
+        all_keys.insert(0, s3_key)
 
-    # 4) 상태를 GETTING으로 바꾸고 WS로 푸시
-    try:
-        db_client.update_upload_status(job_id=job_id, status="GETTING")
-    except Exception as e:
-        print(f"[DB Update Warning] Failed to set GETTING for job_id={job_id}: {e}")
+    for key in all_keys:
+        try:
+            url = s3_client.create_presigned_get_url(key)
+            presigned_urls.append(url)
+        except Exception as e:
+            print(f"[S3 Presign Error] key={key} error={e}")
+            # skip failing keys but continue
 
+    if not presigned_urls:
+        # At least try to generate for the single s3_key that was provided
+        try:
+            presigned_urls.append(s3_client.create_presigned_get_url(s3_key))
+        except Exception as e:
+            print(f"[S3 Presign Error] fallback key={s3_key} error={e}")
+            raise HTTPException(status_code=500, detail="Failed to generate presigned result URL(s)")
+
+    # 4) WS로 푸시 (리스트 전송)
     try:
         # Debug: list active connections before attempting push
         try:
             print(f"[DEBUG] active_connections before push: {list(manager.active_connections.keys())}")
         except Exception:
             print("[DEBUG] could not read manager.active_connections")
-        pushed = await manager.send_result_to_client(job_id, presigned_url)
+        pushed = await manager.send_result_to_client(job_id, presigned_urls)
     except Exception as e:
         print(f"[WS Push Exception] job_id={job_id} error={e}")
         pushed = False
 
+    response_body = {
+        "message": "Result URL(s) generated.",
+        "result_urls": presigned_urls,
+    }
+
     if pushed:
-        return {"message": "Result pushed successfully.", "result_url": presigned_url}
-    else:
-        return {"message": "Client not active. Result URL generated.", "result_url": presigned_url}
+        response_body["message"] = "Result pushed successfully."
+
+    return response_body
+
+
+# ----------------------------------------------------
+# 3. 폴링용 상태 조회 엔드포인트: /result/status
+#    클라이언트(프론트)는 주기적으로 이 엔드포인트를 호출하여
+#    job 상태와 presigned result URL을 확인합니다.
+# ----------------------------------------------------
+@router.get("/status")
+async def get_result_status(job_id: str):
+    if not job_id:
+        raise HTTPException(status_code=400, detail="job_id is required")
+
+    # DB에서 job 레코드 조회
+    try:
+        rec = db_client.get_upload_record(job_id)
+    except Exception as e:
+        print(f"[DB Error] get_upload_record job_id={job_id} error={e}")
+        raise HTTPException(status_code=500, detail="internal error")
+
+    if not rec:
+        raise HTTPException(status_code=404, detail="job not found")
+
+    status = rec.get("status")
+    s3_key = rec.get("s3_result_path")
+    s3_paths = rec.get("s3_result_paths")
+
+    # If the job is COMPLETED, prefer to return all presigned URLs if available
+    result_urls = None
+    if status == "COMPLETED":
+        keys = None
+        if s3_paths:
+            # s3_result_paths might be stored as JSON string by the DB client
+            try:
+                import json as _json
+                keys = _json.loads(s3_paths) if isinstance(s3_paths, str) else s3_paths
+            except Exception:
+                # not JSON — treat as a single path string
+                keys = [s3_paths]
+        elif s3_key:
+            keys = [s3_key]
+
+        if keys:
+            presigned_list = []
+            for key in keys:
+                try:
+                    presigned_list.append(s3_client.create_presigned_get_url(key))
+                except Exception as e:
+                    print(f"[S3 Presign Error] key={key} error={e}")
+                    # skip failing keys
+
+            if presigned_list:
+                result_urls = presigned_list
+
+    # For backward compatibility, include single result_url as first item if present
+    single = result_urls[0] if result_urls else None
+    return {"job_id": job_id, "status": status, "result_url": single, "result_urls": result_urls}

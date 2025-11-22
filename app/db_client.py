@@ -14,17 +14,36 @@ DB_NAME = os.getenv("DB_NAME")
 DB_USER = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_TABLE_NAME = os.getenv("DB_TABLE_NAME")
+DB_SSL_CA = os.getenv("DB_SSL_CA")  # optional path to RDS CA bundle for SSL connections
 
 class DBClient:
     def __init__(self):
         try:
-            self.conn = mysql.connector.connect(
-                host=DB_HOST,
-                port=DB_PORT,
-                database=DB_NAME,
-                user=DB_USER,
-                password=DB_PASSWORD
-            )
+            # Validate basic config
+            if not DB_HOST:
+                raise RuntimeError("DB_HOST is not configured")
+            if not DB_USER:
+                raise RuntimeError("DB_USER is not configured")
+
+            # Ensure port is an int and default to 3306
+            try:
+                port_val = int(DB_PORT) if DB_PORT else 3306
+            except Exception:
+                port_val = 3306
+
+            conn_args = {
+                'host': DB_HOST,
+                'port': port_val,
+                'database': DB_NAME,
+                'user': DB_USER,
+                'password': DB_PASSWORD,
+            }
+
+            # If an SSL CA bundle is provided, pass it through to the connector
+            if DB_SSL_CA:
+                conn_args['ssl_ca'] = DB_SSL_CA
+
+            self.conn = mysql.connector.connect(**conn_args)
         except Exception as e:
             print(f"DB 연결 실패: {e}")
             raise
@@ -77,25 +96,145 @@ class DBClient:
         """
         if not DB_TABLE_NAME:
             raise RuntimeError("DB_TABLE_NAME not configured")
+        # Extended: allow optional s3_result_path and s3_result_paths (JSON string or list)
+        # Try to update both columns if provided; fall back gracefully if the column does not exist.
+        try:
+            if s3_result_path is not None:
+                sql = f"""
+                    UPDATE {DB_TABLE_NAME}
+                    SET processing_status = %s, s3_result_path = %s
+                    WHERE id = %s
+                """
+                params = (status, s3_result_path, job_id)
+            else:
+                sql = f"""
+                    UPDATE {DB_TABLE_NAME}
+                    SET processing_status = %s
+                    WHERE id = %s
+                """
+                params = (status, job_id)
 
-        if s3_result_path is not None:
-            sql = f"""
-                UPDATE {DB_TABLE_NAME}
-                SET processing_status = %s, s3_result_path = %s
-                WHERE id = %s
-            """
-            params = (status, s3_result_path, job_id)
-        else:
-            sql = f"""
-                UPDATE {DB_TABLE_NAME}
-                SET processing_status = %s
-                WHERE id = %s
-            """
-            params = (status, job_id)
+            with self.conn.cursor() as cursor:
+                cursor.execute(sql, params)
+            self.conn.commit()
+        except Exception:
+            # If the simple update failed (e.g., missing column), attempt a more conservative update
+            try:
+                sql = f"""
+                    UPDATE {DB_TABLE_NAME}
+                    SET processing_status = %s
+                    WHERE id = %s
+                """
+                params = (status, job_id)
+                with self.conn.cursor() as cursor:
+                    cursor.execute(sql, params)
+                self.conn.commit()
+            except Exception as e:
+                print(f"[DB Update Error - fallback] job_id={job_id} error={e}")
+                raise
 
-        with self.conn.cursor() as cursor:
-            cursor.execute(sql, params)
-        self.conn.commit()
+    def update_upload_status_with_paths(self, job_id: str, status: str, s3_result_path: Optional[str] = None, s3_result_paths: Optional[str] = None) -> None:
+        """
+        Try to update processing_status, s3_result_path and s3_result_paths (JSON) if available.
+        s3_result_paths may be a JSON-encoded string or None. This method will attempt to write
+        the additional column but will silently fall back to updating only processing_status and
+        s3_result_path if the s3_result_paths column is not present in the DB schema.
+        """
+        if not DB_TABLE_NAME:
+            raise RuntimeError("DB_TABLE_NAME not configured")
+
+        # Prefer single SQL write including s3_result_paths if provided
+        try:
+            if s3_result_paths is not None and s3_result_path is not None:
+                sql = f"""
+                    UPDATE {DB_TABLE_NAME}
+                    SET processing_status = %s, s3_result_path = %s, s3_result_paths = %s
+                    WHERE id = %s
+                """
+                params = (status, s3_result_path, s3_result_paths, job_id)
+            elif s3_result_paths is not None:
+                sql = f"""
+                    UPDATE {DB_TABLE_NAME}
+                    SET processing_status = %s, s3_result_paths = %s
+                    WHERE id = %s
+                """
+                params = (status, s3_result_paths, job_id)
+            elif s3_result_path is not None:
+                sql = f"""
+                    UPDATE {DB_TABLE_NAME}
+                    SET processing_status = %s, s3_result_path = %s
+                    WHERE id = %s
+                """
+                params = (status, s3_result_path, job_id)
+            else:
+                sql = f"""
+                    UPDATE {DB_TABLE_NAME}
+                    SET processing_status = %s
+                    WHERE id = %s
+                """
+                params = (status, job_id)
+
+            with self.conn.cursor() as cursor:
+                cursor.execute(sql, params)
+            self.conn.commit()
+        except Exception:
+            # Fallback: try to update at least the basic status and s3_result_path
+            try:
+                sql = f"""
+                    UPDATE {DB_TABLE_NAME}
+                    SET processing_status = %s, s3_result_path = %s
+                    WHERE id = %s
+                """
+                params = (status, s3_result_path, job_id)
+                with self.conn.cursor() as cursor:
+                    cursor.execute(sql, params)
+                self.conn.commit()
+            except Exception as e:
+                print(f"[DB Update Error - fallback2] job_id={job_id} error={e}")
+                raise
+
+    def get_upload_record(self, job_id: str) -> Optional[dict]:
+        """
+        Return a dictionary with upload record fields used by the API.
+        Tries to include s3_result_paths if the column exists; otherwise returns basic fields.
+        """
+        if not DB_TABLE_NAME:
+            raise RuntimeError("DB_TABLE_NAME not configured")
+
+        # Attempt to select s3_result_paths; if that fails, fall back to fewer columns
+        try:
+            sql = f"SELECT id, user_id, processing_status, s3_result_path, s3_result_paths FROM {DB_TABLE_NAME} WHERE id = %s LIMIT 1"
+            with self.conn.cursor() as cursor:
+                cursor.execute(sql, (job_id,))
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                return {
+                    "job_id": row[0],
+                    "user_id": row[1],
+                    "status": row[2],
+                    "s3_result_path": row[3],
+                    "s3_result_paths": row[4],
+                }
+        except Exception:
+            # Fallback to select without s3_result_paths
+            try:
+                sql = f"SELECT id, user_id, processing_status, s3_result_path FROM {DB_TABLE_NAME} WHERE id = %s LIMIT 1"
+                with self.conn.cursor() as cursor:
+                    cursor.execute(sql, (job_id,))
+                    row = cursor.fetchone()
+                    if not row:
+                        return None
+                    return {
+                        "job_id": row[0],
+                        "user_id": row[1],
+                        "status": row[2],
+                        "s3_result_path": row[3],
+                        "s3_result_paths": None,
+                    }
+            except Exception as e:
+                print(f"[DB Select Error] job_id={job_id} error={e}")
+                raise
 
     def get_job_owner(self, job_id: str) -> Optional[str]:
         """

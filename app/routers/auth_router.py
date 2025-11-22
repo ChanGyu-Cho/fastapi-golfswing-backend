@@ -27,16 +27,23 @@ if CLIENT_SECRETS_RAW:
             cid, secret = pair.split(":", 1)
             CLIENT_SECRETS_MAP[cid.strip()] = secret.strip()
 # Back end host
-BACKEND_HOST = os.getenv("BACKEND_HOST", "http://localhost:29001")
+BACKEND_HOST = os.getenv("BACKEND_HOST")
 # Frontend callback URI (used when we want Cognito to redirect to the web app)
 REDIRECT_URI_FRONTEND = os.getenv("REDIRECT_URI_FRONTEND") or os.getenv("FRONTEND_CALLBACK")
 
 def _cleanup_sessions():
     now = time.time()
     with _LOCK:
+        removed = []
         for k in list(_SESSIONS.keys()):
             if _SESSIONS[k]["expires_at"] < now:
+                removed.append(k)
                 del _SESSIONS[k]
+        if removed:
+            try:
+                print(f"[auth_router] cleaned up expired sessions: {removed}")
+            except Exception:
+                pass
 
 
 @router.post("/start")
@@ -84,14 +91,20 @@ async def auth_start(request: Request):
         pass
 
     now = time.time()
+    # increase TTL to 5 minutes to avoid quick expiry during user interaction
+    ttl = 300
     with _LOCK:
         _SESSIONS[session_id] = {
             "created": now,
-            "expires_at": now + 120,  # 2 minutes
+            "expires_at": now + ttl,
             "status": "pending",
             "tokens": None,
             "client_id": chosen_client_id
         }
+    try:
+        print(f"[auth_router] created session_id={session_id} expires_at={_SESSIONS[session_id]['expires_at']}")
+    except Exception:
+        pass
 
     # quick cleanup
     _cleanup_sessions()
@@ -110,7 +123,17 @@ def auth_callback(request: Request):
 
     with _LOCK:
         sess = _SESSIONS.get(state)
+        # Debug: print available sessions for triage
+        try:
+            print(f"[auth_router] callback state={state} available_sessions={list(_SESSIONS.keys())}")
+        except Exception:
+            pass
     if not sess:
+        # More detailed debug output before returning
+        try:
+            print(f"[auth_router] Invalid or expired session state: {state}. Current sessions: {list(_SESSIONS.items())}")
+        except Exception:
+            pass
         return Response(content="Invalid or expired session state", status_code=400)
 
     # Exchange code for tokens
